@@ -3,6 +3,9 @@
 // STATUS: BELUM DIUJI pada peranti. Baca BACA_SAYA.md dahulu.
 #include <mod/amlmod.h>
 #include <mod/logger.h>
+#if __has_include(<mod/config.h>)
+#include <mod/config.h>
+#endif
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -178,7 +181,7 @@ extern "C" void OnModLoad() {
     IdIndex   = (IdIndex_t)  aml->GetSym(h, "_Z17RpHAnimIDGetIndexP16RpHAnimHierarchyi");
     g_timeStep = (float*)    aml->GetSym(h, "_ZN6CTimer12ms_fTimeStepE");
     g_frame    = (uint32_t*) aml->GetSym(h, "_ZN6CTimer14m_FrameCounterE");
-    void* render = aml->GetSym(h, "_ZN4CPed6RenderEv");
+    void* render = (void*)aml->GetSym(h, "_ZN4CPed6RenderEv");
     if (!GetHier || !GetMatArr || !IdIndex || !g_timeStep || !g_frame || !render) {
         logger->Error("Satu atau lebih simbol tidak ditemui - mod tidak diaktifkan"); return;
     }
