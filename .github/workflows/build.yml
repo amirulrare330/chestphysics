@@ -1,1 +1,21 @@
-
+name: Bina mod
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dapatkan header AML
+        run: |
+          git clone --depth 1 https://github.com/RusJJ/AndroidModLoader.git aml_repo
+          mkdir -p aml_sdk
+          cp -r aml_repo/mod aml_sdk/mod
+      - name: Compile
+        run: |
+          $ANDROID_NDK_LATEST_HOME/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk NDK_APPLICATION_MK=Application.mk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChestPhysics
+          path: |
+            libs/armeabi-v7a/libChestPhysics.so
+            ChestPhysics.ini
