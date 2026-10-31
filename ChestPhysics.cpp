@@ -13,6 +13,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
+#include <cstdarg>
+#include <sys/mman.h>
+#include <unistd.h>
 
 MYMODCFG(net.user.chestphysics, ChestPhysicsAML, 0.1.0, ChestPhysics)
 
@@ -26,6 +30,7 @@ enum { BONE_SPINE1 = 3, BONE_UPPERTORSO = 4, BONE_R_CLAVICLE = 21, BONE_L_CLAVIC
 
 // ---------- Konfigurasi (ChestPhysics.ini) ----------
 struct Cfg {
+    int   stage = 2;                              // 0=muat sahaja, 1=hook tanpa fizik, 2=penuh
     bool  enabled = true, femaleOnly = true, flex = false;
     float spring = 120.f, damping = 7.f;
     float respV = 0.9f, respH = 0.5f;             // sensitiviti terhadap pecutan (menegak / mendatar)
@@ -36,11 +41,22 @@ struct Cfg {
     std::vector<int> femaleTypes = {5, 22};       // CIVFEMALE, PROSTITUTE
 } C;
 
+// ---------- Catatan ke fail (untuk cari punca crash) ----------
+static std::string g_logPath;
+static bool g_verbose = false;
+static void Log(const char* fmt, ...) {
+    if (g_logPath.empty()) return;
+    FILE* f = fopen(g_logPath.c_str(), "a");
+    if (!f) return;
+    va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a);
+    fputc('\n', f); fclose(f);
+}
+
 static void LoadIni() {
     const char* dir = aml->GetConfigPath();
     std::string path = std::string(dir ? dir : ".") + "/ChestPhysics.ini";
     std::ifstream f(path);
-    if (!f) { logger->Info("ChestPhysics.ini tiada, guna nilai asal (%s)", path.c_str()); return; }
+    if (!f) { Log("ini tiada, guna nilai asal (%s)", path.c_str()); return; }
     std::string line;
     while (std::getline(f, line)) {
         if (line.empty() || line[0] == ';' || line[0] == '#' || line[0] == '[') continue;
@@ -52,6 +68,7 @@ static void LoadIni() {
         trim(k); trim(v);
         float fv = (float)atof(v.c_str());
         if      (k == "enabled")         C.enabled = atoi(v.c_str()) != 0;
+        else if (k == "stage")           C.stage = atoi(v.c_str());
         else if (k == "mode")            C.flex = (v == "flex");
         else if (k == "female_only")     C.femaleOnly = atoi(v.c_str()) != 0;
         else if (k == "ped_type_offset") C.pedTypeOffset = (uint32_t)strtoul(v.c_str(), nullptr, 0);
@@ -113,23 +130,32 @@ static void StepSpring(Spring& s, V3 aLocal, float dt, float kMul) {
 
 static bool IsFemale(void* ped) {
     if (!C.femaleOnly) return true;
+    if (g_verbose) Log("A: baca jenis ped di offset 0x%x", (unsigned)C.pedTypeOffset);
     int t = *(int*)((char*)ped + C.pedTypeOffset);
+    if (g_verbose) Log("A: jenis ped = %d", t);
     for (int ft : C.femaleTypes) if (t == ft) return true;
     return false;
 }
 
 static void Apply(void* ped) {
     if (!IsFemale(ped)) return;
+    if (g_verbose) Log("B: baca clump di offset 0x18");
     void* clump = *(void**)((char*)ped + 0x18);          // CEntity::m_pRwObject - SAHKAN utk v2.0
-    if (!clump) return;
+    if (g_verbose) Log("B: clump = %p", clump);
+    if (!clump || (uintptr_t)clump < 0x10000) return;
     PedState& st = g_states[ped];
     uint32_t frame = *g_frame;
     if (st.frame == frame) return;                          // sekali sahaja setiap frame
-    void* hier = GetHier(clump); if (!hier) return;
-    RwMat* arr = GetMatArr(hier); if (!arr) return;
+    void* hier = GetHier(clump);
+    if (g_verbose) Log("C: hierarki = %p", hier);
+    if (!hier) return;
+    RwMat* arr = GetMatArr(hier);
+    if (g_verbose) Log("D: tatasusunan matriks = %p", (void*)arr);
+    if (!arr) return;
     int iT = IdIndex(hier, BONE_UPPERTORSO), iS = IdIndex(hier, BONE_SPINE1);
     int iRC = IdIndex(hier, BONE_R_CLAVICLE), iLC = IdIndex(hier, BONE_L_CLAVICLE);
     int iR = IdIndex(hier, BONE_R_BREAST), iL = IdIndex(hier, BONE_L_BREAST);
+    if (g_verbose) Log("E: indeks tulang T=%d S=%d RC=%d LC=%d R=%d L=%d", iT, iS, iRC, iLC, iR, iL);
     if (iT < 0 || iS < 0 || iRC < 0 || iLC < 0 || (iR < 0 && iL < 0)) return;
 
     // Bingkai tempatan dada dalam ruang dunia (matriks hierarki ialah ruang dunia)
@@ -157,6 +183,7 @@ static void Apply(void* ped) {
         arr[idx].pos = {arr[idx].pos.x + d.x, arr[idx].pos.y + d.y, arr[idx].pos.z + d.z};
     };
     shift(iR, st.R); shift(iL, st.L);
+    if (g_verbose) Log("F: fizik digunakan pada satu ped");
 
     static uint32_t lastClean = 0;                           // buang ped lama
     if (frame - lastClean > 600) {
@@ -166,25 +193,69 @@ static void Apply(void* ped) {
     }
 }
 
-static void Render_hook(void* ped) {
+static int g_calls = 0;
+static void Render_pass(void* ped) {            // peringkat 1: hook sahaja
+    if (g_calls < 3) { g_calls++; Log("Render dipanggil (pass) #%d ped=%p", g_calls, ped); }
+    Render_orig(ped);
+}
+static void Render_hook(void* ped) {            // peringkat 2: fizik penuh
+    g_verbose = (g_calls < 3);
+    if (g_verbose) { g_calls++; Log("Render dipanggil (penuh) #%d ped=%p", g_calls, ped); }
     if (C.enabled) Apply(ped);
+    g_verbose = false;
     Render_orig(ped);
 }
 
 extern "C" void OnModLoad() {
-    logger->SetTag("ChestPhysicsAML");
+    const char* dir = aml->GetConfigPath();
+    g_logPath = std::string(dir ? dir : ".") + "/ChestPhysics.log";
+    remove(g_logPath.c_str());
+    Log("1: OnModLoad bermula, configPath=%s", dir ? dir : "(null)");
     LoadIni();
+    Log("2: ini dibaca: stage=%d female_only=%d ped_type_offset=0x%x", C.stage, (int)C.femaleOnly, (unsigned)C.pedTypeOffset);
     void* h = aml->GetLibHandle("libGTASA.so");
-    if (!h) { logger->Error("libGTASA.so tidak ditemui"); return; }
+    Log("3: handle libGTASA = %p", h);
+    if (!h) { Log("GAGAL: libGTASA.so tidak ditemui"); return; }
     GetHier   = (GetHier_t)  aml->GetSym(h, "_Z29GetAnimHierarchyFromSkinClumpP7RpClump");
     GetMatArr = (GetMatArr_t)aml->GetSym(h, "_Z30RpHAnimHierarchyGetMatrixArrayP16RpHAnimHierarchy");
     IdIndex   = (IdIndex_t)  aml->GetSym(h, "_Z17RpHAnimIDGetIndexP16RpHAnimHierarchyi");
     g_timeStep = (float*)    aml->GetSym(h, "_ZN6CTimer12ms_fTimeStepE");
     g_frame    = (uint32_t*) aml->GetSym(h, "_ZN6CTimer14m_FrameCounterE");
     void* render = (void*)aml->GetSym(h, "_ZN4CPed6RenderEv");
+    Log("4: simbol: hier=%p mat=%p idx=%p step=%p frame=%p render=%p",
+        (void*)GetHier, (void*)GetMatArr, (void*)IdIndex, (void*)g_timeStep, (void*)g_frame, render);
     if (!GetHier || !GetMatArr || !IdIndex || !g_timeStep || !g_frame || !render) {
-        logger->Error("Satu atau lebih simbol tidak ditemui - mod tidak diaktifkan"); return;
+        Log("GAGAL: satu atau lebih simbol tidak ditemui"); return;
     }
-    aml->Hook(render, (void*)Render_hook, (void**)&Render_orig);
-    logger->Info("Dimuatkan (mode: %s)", C.flex ? "flex" : "classic");
+    if (C.stage <= 0) { Log("5: stage 0 - tiada pemasangan (ujian muat sahaja)"); return; }
+
+    // Pasang melalui vtable (bukan hook inline) supaya tidak bertembung dengan mod lain
+    // yang meng-hook badan CPed::Render. Slot 21 = CPed::Render (disahkan dari libGTASA.so v2.0).
+    const int kRenderSlot = 21;
+    void** vt = (void**)aml->GetSym(h, "_ZTV4CPed");
+    Log("5: vtable CPed = %p", (void*)vt);
+    if (!vt) { Log("GAGAL: vtable CPed tiada"); return; }
+    if (vt[kRenderSlot] != render)
+        Log("AMARAN: slot %d (%p) bukan CPed::Render (%p) - mungkin dipatch mod lain; guna nilai semasa sebagai asal",
+            kRenderSlot, vt[kRenderSlot], render);
+    void* origEntry = vt[kRenderSlot];
+    Render_orig = (void (*)(void*))origEntry;
+    void* repl = (C.stage == 1) ? (void*)Render_pass : (void*)Render_hook;
+
+    static const char* kVtables[] = { "_ZTV4CPed", "_ZTV10CPlayerPed", "_ZTV12CCivilianPed",
+                                      "_ZTV7CCopPed", "_ZTV13CEmergencyPed" };
+    long pg = sysconf(_SC_PAGESIZE);
+    int patched = 0;
+    for (const char* name : kVtables) {
+        void** t = (void**)aml->GetSym(h, name);
+        if (!t) { Log("  %s: tiada", name); continue; }
+        if (t[kRenderSlot] != origEntry) { Log("  %s: slot lain (%p), dilangkau", name, t[kRenderSlot]); continue; }
+        void** slot = &t[kRenderSlot];
+        uintptr_t page = (uintptr_t)slot & ~(uintptr_t)(pg - 1);
+        if (mprotect((void*)page, (size_t)pg, PROT_READ | PROT_WRITE) != 0) { Log("  %s: mprotect gagal", name); continue; }
+        *slot = repl;
+        patched++;
+        Log("  %s: dipatch", name);
+    }
+    Log("6: selesai, %d vtable dipatch (stage %d)", patched, C.stage);
 }
